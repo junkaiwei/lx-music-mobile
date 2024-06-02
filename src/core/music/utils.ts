@@ -1,3 +1,4 @@
+import {PermissionsAndroid, Platform} from 'react-native';
 import musicSdk, { findMusic } from '@/utils/musicSdk'
 import {
   getOtherSource as getOtherSourceFromStore,
@@ -6,11 +7,91 @@ import {
   getPlayerLyric as getStoreLyric,
 } from '@/utils/data'
 import { langS2T, toNewMusicInfo, toOldMusicInfo } from '@/utils'
-import { assertApiSupport } from '@/utils/tools'
+import { assertApiSupport, toast } from '@/utils/tools'
 import settingState from '@/store/setting/state'
 import { requestMsg } from '@/utils/message'
 import BackgroundTimer from 'react-native-background-timer'
 import { apis } from '@/utils/musicSdk/api-source'
+import RNFetchBlob from 'rn-fetch-blob';
+import {getLyricInfo} from "@/core/music/index";
+import {writeMetaData} from "@/utils/nativeModules/metadata";
+
+export async function requestStoragePermission() {
+  const granted = await PermissionsAndroid.request(
+    PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE,
+    {
+      title: '存储读写权限申请',
+        message:
+          '洛雪音乐助手需要使用存储读写权限才能读取音乐.',
+        // buttonNeutral: '一会再问我',
+        // buttonNegative: '取消',
+        buttonPositive: '确定',
+    },
+  );
+
+  if (granted === PermissionsAndroid.RESULTS.GRANTED) {
+    return Promise.resolve();
+  }
+  return Promise.reject();
+}
+
+export function getFileExtension(url:string) {
+  // 使用正则表达式匹配URL中的文件扩展名
+  const match = url.match(/\.([0-9a-z]+)(?=[?#]|$)/i);
+
+  // 如果匹配到扩展名，则返回该扩展名，否则返回默认值'mp3'
+  return match ? match[1] : 'mp3';
+}
+
+const downloadMusicWithLrc = async ({url, fileName, musicInfo, picUrl, quality}: {url: string, fileName: string, musicInfo: LX.Music.MusicInfoOnline, picUrl?:string, quality?: LX.Quality} ,options: DownloadOptions) => {
+  const dirs = RNFetchBlob.fs.dirs;
+  const extension = getFileExtension(url);
+  let path = `${dirs.DownloadDir}/lx.music/${fileName}.${extension}`;
+  let lrcPath = `${dirs.DownloadDir}/lx.music/${fileName}.lrc`
+  return requestStoragePermission().then(async ()=>{
+    const exists = await RNFetchBlob.fs.exists(path);
+    if(exists && options.isSkipFile){
+      return Promise.reject('下载目录存在相同文件已跳过')
+    }
+    if(exists && !options.isSkipFile){
+      const now = Date.now()
+      path = `${dirs.DownloadDir}/lx.music/${fileName}_${now}.${extension}`;
+      lrcPath = `${dirs.DownloadDir}/lx.music/${fileName}_${now}.lrc`
+    }
+    const task: Promise<any>[] = [
+      RNFetchBlob.config({
+        fileCache: true,
+        addAndroidDownloads: {
+          useDownloadManager: true,
+          notification: true,
+          path: path,
+          description: 'Downloading file.',
+        },
+      }).fetch('GET', url)
+    ]
+    if(options.isDownloadLrc) task.push(
+      getLyricInfo({musicInfo, onToggleSource: ()=>{}}).then(async ({lyric})=>{
+        return RNFetchBlob.fs.writeFile(
+          lrcPath,
+          lyric,
+          'utf8'
+        )
+      })
+    )
+    return Promise.allSettled(task).then(()=>{
+      console.log('123');
+      return writeMetaData(path,{
+        singer: musicInfo.singer,
+        name: musicInfo.name,
+        picUrl: (typeof picUrl === "string" && picUrl.startsWith('http') ? picUrl : undefined),
+        quality
+      })
+    })
+
+  }).catch((e)=>{
+    return Promise.reject(e ?? "权限获取失败")
+  })
+};
 
 
 const getOtherSourcePromises = new Map()
@@ -323,7 +404,45 @@ export const handleGetOnlineMusicUrl = async({ musicInfo, quality, onToggleSourc
   })
 }
 
+interface DownloadOptions {
+  isDownloadLrc: boolean,
+  isEnableDownload: boolean,
+  isSkipFile: boolean
+}
 
+
+export const downloadMusic = (musicInfo: LX.Music.MusicInfoOnline, options: DownloadOptions, quality?: LX.Quality)=>{
+  toast('开始下载...')
+  Promise.all([
+    handleGetOnlineMusicUrl({
+      musicInfo: musicInfo,
+      isRefresh:false,
+      allowToggleSource: true,
+      quality,
+      onToggleSource:()=>{},
+    }),
+    handleGetOnlinePicUrl({
+      musicInfo: musicInfo,
+      isRefresh:false,
+      allowToggleSource: true,
+      onToggleSource:()=>{},
+    })
+  ]).then(([urlRes, picRes])=>{
+    return downloadMusicWithLrc({
+      url: urlRes.url,
+      fileName: `${urlRes.musicInfo.name}-${urlRes.musicInfo.singer}-${quality}`,
+      picUrl: picRes.url,
+      quality,
+      musicInfo
+    }, options)
+  }).then(()=>{
+    console.log('download success');
+    toast('下载成功')
+  }).catch((msg)=>{
+    toast(msg || '获取下载地址失败')
+  })
+
+}
 export const getOnlineOtherSourcePicUrl = async({ musicInfos, onToggleSource, isRefresh, retryedSource = [] }: {
   musicInfos: LX.Music.MusicInfoOnline[]
   onToggleSource: (musicInfo?: LX.Music.MusicInfoOnline) => void
